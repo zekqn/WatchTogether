@@ -1,0 +1,1006 @@
+// lib/main.dart
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:youtube_player_flutter/youtube_player_flutter.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
+
+void main() {
+  runApp(const AppRoot());
+}
+
+/// ---------------- AppRoot ----------------
+class AppRoot extends StatelessWidget {
+  const AppRoot({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: "WatchTogether",
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        primaryColor: const Color(0xFF6C29FF),
+        scaffoldBackgroundColor: const Color(0xFF0F0F19),
+        colorScheme: const ColorScheme.dark(
+          primary: Color(0xFF6C29FF),
+          secondary: Color(0xFF9C5CFF),
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: const Color(0xFF1C1C2A),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: BorderSide.none,
+          ),
+        ),
+      ),
+      home: const MainNavigation(),
+    );
+  }
+}
+
+/// ---------------- WebSocketService (singleton) ----------------
+/// Use WebSocketService.instance.connect(url) once (e.g. in initState of MainNavigation).
+/// It forwards raw messages into a broadcast Stream so pages can listen without double-listening errors.
+class WebSocketService {
+  WebSocketService._internal();
+  static final WebSocketService instance = WebSocketService._internal();
+
+  WebSocketChannel? _channel;
+  StreamSubscription? _channelSub;
+
+  final StreamController<Map<String, dynamic>> _controller =
+      StreamController<Map<String, dynamic>>.broadcast();
+
+  Stream<Map<String, dynamic>> get stream => _controller.stream;
+
+  bool get connected => _channel != null;
+
+  void connect(String url) {
+    if (_channel != null) return; // already connected
+    _channel = WebSocketChannel.connect(Uri.parse(url));
+    _channelSub = _channel!.stream.listen(
+      (data) {
+        try {
+          final parsed = jsonDecode(data);
+          if (parsed is Map<String, dynamic>) _controller.add(parsed);
+        } catch (e) {
+          // ignore non-json or parse errors
+        }
+      },
+      onDone: () {
+        _cleanup();
+      },
+      onError: (e) {
+        _cleanup();
+      },
+    );
+  }
+
+  void _cleanup() {
+    try {
+      _channelSub?.cancel();
+    } catch (e) {}
+    _channelSub = null;
+    _channel = null;
+    // do not close broadcast controller (keeps available to listeners)
+  }
+
+  void send(Map<String, dynamic> payload) {
+    try {
+      if (_channel != null) _channel!.sink.add(jsonEncode(payload));
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  void dispose() {
+    try {
+      _channelSub?.cancel();
+    } catch (e) {}
+    try {
+      _channel?.sink.close();
+    } catch (e) {}
+    _cleanup();
+    try {
+      _controller.close();
+    } catch (e) {}
+  }
+}
+
+/// ---------------- MainNavigation (bottom nav) ----------------
+class MainNavigation extends StatefulWidget {
+  const MainNavigation({super.key});
+
+  @override
+  State<MainNavigation> createState() => _MainNavigationState();
+}
+
+class _MainNavigationState extends State<MainNavigation> {
+  int index = 0;
+  late final String username;
+
+  // server URL — замените на свой render/локальный адрес
+  final String serverUrl = "wss://watchtogetger-server.onrender.com";
+
+  @override
+  void initState() {
+    super.initState();
+    username = "User${DateTime.now().millisecondsSinceEpoch % 10000}";
+    WebSocketService.instance.connect(serverUrl);
+  }
+
+  @override
+  void dispose() {
+    // Не закрываем WebSocketService тут — держим соединение при навигации.
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = [
+      HomePage(username: username),
+      RoomsPage(username: username),
+      CreateRoomPage(username: username),
+      ProfilePage(username: username),
+    ];
+
+    return Scaffold(
+      body: pages[index],
+      bottomNavigationBar: NavigationBar(
+        height: 70,
+        backgroundColor: const Color(0xFF161622),
+        indicatorColor: const Color(0xFF6C29FF),
+        selectedIndex: index,
+        onDestinationSelected: (i) => setState(() => index = i),
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.play_circle_outline),
+            label: "Главная",
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.people_alt_outlined),
+            label: "Комнаты",
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.add_circle_outline),
+            label: "Создать",
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.person_outline),
+            label: "Профиль",
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// ---------------- HomePage ----------------
+class HomePage extends StatefulWidget {
+  final String username;
+  const HomePage({super.key, required this.username});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  late final WebSocketService ws;
+  final TextEditingController _msg = TextEditingController();
+  final TextEditingController _video = TextEditingController();
+  final List<Map<String, String>> messages = [];
+  late YoutubePlayerController _yt;
+  bool videoLoaded = false;
+  VoiceChatManager? voice;
+  bool micEnabled = true;
+
+  @override
+  void initState() {
+    super.initState();
+    ws = WebSocketService.instance;
+    _yt = YoutubePlayerController(
+      initialVideoId: "",
+      flags: const YoutubePlayerFlags(autoPlay: false),
+    );
+
+    // listen to broadcast stream (no double-listen problems)
+    ws.stream.listen((data) {
+      final t = data['type'];
+      if (t == 'message') {
+        setState(
+          () => messages.insert(0, {
+            "user": data['username'] ?? '',
+            "text": data['text'] ?? '',
+          }),
+        );
+      } else if (t == 'video_control' && data['videoId'] != null) {
+        final id = data['videoId'].toString();
+        if (id.isNotEmpty) {
+          _yt.load(id);
+          setState(() => videoLoaded = true);
+        }
+      } else if (t == 'signal') {
+        voice?.handleSignal(data);
+      }
+    });
+
+    // connect voice manager for general room "home" usage if needed
+    voice = VoiceChatManager(
+      username: widget.username,
+      roomId: 'home',
+      channelService: ws,
+    );
+    voice!.init();
+  }
+
+  void sendMessage() {
+    final text = _msg.text.trim();
+    if (text.isEmpty) return;
+    ws.send({
+      "type": "message",
+      "username": widget.username,
+      "text": text,
+      "roomId": "home",
+    });
+    setState(() {
+      messages.insert(0, {"user": widget.username, "text": text});
+      _msg.clear();
+    });
+  }
+
+  void changeVideo() {
+    final url = _video.text.trim();
+    if (url.isEmpty) return;
+    final id = YoutubePlayer.convertUrlToId(url);
+    if (id == null) return;
+    ws.send({
+      "type": "video_control",
+      "action": "load",
+      "videoId": id,
+      "roomId": "home",
+    });
+    _yt.load(id);
+    setState(() => videoLoaded = true);
+  }
+
+  @override
+  void dispose() {
+    try {
+      _yt.dispose();
+    } catch (_) {}
+    try {
+      voice?.dispose();
+    } catch (_) {}
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("WatchTogether"),
+        centerTitle: true,
+        backgroundColor: Colors.transparent,
+      ),
+      body: Column(
+        children: [
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 350),
+            child: videoLoaded
+                ? YoutubePlayer(controller: _yt, key: const ValueKey("player"))
+                : Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      children: [
+                        TextField(
+                          controller: _video,
+                          decoration: const InputDecoration(
+                            hintText: "Вставь ссылку на видео",
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        ElevatedButton(
+                          onPressed: changeVideo,
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF6C29FF),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                          ),
+                          child: const Text("Загрузить видео"),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: ListView.builder(
+                reverse: true,
+                itemCount: messages.length,
+                itemBuilder: (c, i) {
+                  final m = messages[i];
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        CircleAvatar(
+                          backgroundColor: const Color(0xFF6C29FF),
+                          child: Text(
+                            (m["user"] ?? "?").isNotEmpty
+                                ? (m["user"] ?? "?")[0]
+                                : "?",
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1C1C2A),
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  m["user"] ?? "",
+                                  style: const TextStyle(
+                                    color: Color(0xFF9C5CFF),
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(m["text"] ?? ""),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _msg,
+                    decoration: const InputDecoration(hintText: "Сообщение..."),
+                    onSubmitted: (_) => sendMessage(),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                IconButton(
+                  icon: const Icon(Icons.send, size: 28),
+                  onPressed: sendMessage,
+                ),
+                const SizedBox(width: 6),
+                IconButton(
+                  icon: Icon(micEnabled ? Icons.mic : Icons.mic_off, size: 28),
+                  onPressed: () {
+                    micEnabled = !micEnabled;
+                    final stream = voice?.localStream;
+                    if (stream != null)
+                      for (var t in stream.getAudioTracks())
+                        t.enabled = micEnabled;
+                    setState(() {});
+                  },
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// ---------------- RoomsPage ----------------
+class RoomsPage extends StatefulWidget {
+  final String username;
+  const RoomsPage({super.key, required this.username});
+
+  @override
+  State<RoomsPage> createState() => _RoomsPageState();
+}
+
+class _RoomsPageState extends State<RoomsPage> {
+  final WebSocketService ws = WebSocketService.instance;
+  List<Map<String, dynamic>> rooms = [];
+
+  @override
+  void initState() {
+    super.initState();
+    ws.stream.listen((d) {
+      if (d['type'] == 'rooms_list') {
+        setState(() {
+          rooms = List<Map<String, dynamic>>.from(d['rooms'] ?? []);
+        });
+      } else if (d['type'] == 'room_created') {
+        // refresh
+        _requestRooms();
+      } else if (d['type'] == 'enter_ok') {
+        final roomId = d['roomId'];
+        final roomMeta = Map<String, dynamic>.from(d['roomMeta'] ?? {});
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => RoomHostPage(
+              channelService: ws,
+              username: widget.username,
+              roomId: roomId,
+              roomMeta: roomMeta,
+            ),
+          ),
+        );
+      } else if (d['type'] == 'error') {
+        final reason = d['reason'] ?? 'unknown';
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Server error: $reason')));
+      }
+    });
+    Future.delayed(const Duration(milliseconds: 200), _requestRooms);
+  }
+
+  void _requestRooms() {
+    ws.send({"type": "list_rooms"});
+  }
+
+  void _createRoomShortcut() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CreateRoomPage(username: widget.username),
+      ),
+    );
+  }
+
+  void _enterRoom(Map<String, dynamic> room) async {
+    if (room['isPrivate'] == true) {
+      final pass = await showDialog<String?>(
+        context: context,
+        builder: (_) {
+          final ctrl = TextEditingController();
+          return AlertDialog(
+            title: Text('Пароль для "${room['name']}"'),
+            content: TextField(controller: ctrl, obscureText: true),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, null),
+                child: const Text('Отмена'),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.pop(context, ctrl.text.trim()),
+                child: const Text('Войти'),
+              ),
+            ],
+          );
+        },
+      );
+      if (pass == null) return;
+      ws.send({
+        "type": "enter_room",
+        "roomId": room['id'],
+        "username": widget.username,
+        "password": pass,
+      });
+    } else {
+      ws.send({
+        "type": "enter_room",
+        "roomId": room['id'],
+        "username": widget.username,
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Комнаты'),
+        centerTitle: true,
+        actions: [
+          IconButton(icon: const Icon(Icons.refresh), onPressed: _requestRooms),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            ElevatedButton.icon(
+              onPressed: _createRoomShortcut,
+              icon: const Icon(Icons.add),
+              label: const Text("Создать комнату"),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF6C29FF),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: RefreshIndicator(
+                onRefresh: () async => _requestRooms(),
+                child: ListView.builder(
+                  itemCount: rooms.length,
+                  itemBuilder: (c, i) {
+                    final r = rooms[i];
+                    return Card(
+                      color: const Color(0xFF12121A),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: ListTile(
+                        title: Text(r['name'] ?? r['id'] ?? 'Комната'),
+                        subtitle: Text(
+                          "Участников: ${r['participants'] ?? 0} ${r['isPrivate'] == true ? ' • Приват' : ''}",
+                        ),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () => _enterRoom(r),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// ---------------- CreateRoomPage ----------------
+class CreateRoomPage extends StatefulWidget {
+  final String username;
+  final WebSocketService? channelService;
+  const CreateRoomPage({
+    super.key,
+    required this.username,
+    this.channelService,
+  });
+
+  @override
+  State<CreateRoomPage> createState() => _CreateRoomPageState();
+}
+
+class _CreateRoomPageState extends State<CreateRoomPage> {
+  final nameCtrl = TextEditingController();
+  final videoCtrl = TextEditingController();
+  final passCtrl = TextEditingController();
+  bool isPrivate = false;
+  bool creating = false;
+
+  WebSocketService get ws => widget.channelService ?? WebSocketService.instance;
+
+  void _createRoom() {
+    final name = nameCtrl.text.trim();
+    if (name.isEmpty) return;
+    final videoUrl = videoCtrl.text.trim();
+    final id =
+        name.replaceAll(RegExp(r'\s+'), '_').toLowerCase() +
+        '_' +
+        DateTime.now().millisecondsSinceEpoch.toString().substring(8);
+    final videoId = videoUrl.isEmpty
+        ? null
+        : YoutubePlayer.convertUrlToId(videoUrl) ?? videoUrl;
+    final payload = {
+      "type": "create_room",
+      "name": name,
+      "id": id,
+      "isPrivate": isPrivate,
+      "password": isPrivate ? passCtrl.text.trim() : null,
+      "videoId": videoId,
+      "creator": widget.username,
+    };
+    setState(() => creating = true);
+    ws.send(payload);
+    Future.delayed(const Duration(milliseconds: 300), () {
+      setState(() => creating = false);
+      Navigator.pop(context);
+    });
+  }
+
+  @override
+  void dispose() {
+    nameCtrl.dispose();
+    videoCtrl.dispose();
+    passCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("Создать комнату"), centerTitle: true),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: ListView(
+          children: [
+            TextField(
+              controller: nameCtrl,
+              decoration: const InputDecoration(labelText: "Название комнаты"),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: videoCtrl,
+              decoration: const InputDecoration(
+                labelText: "Ссылка на YouTube (опционально)",
+              ),
+            ),
+            const SizedBox(height: 12),
+            SwitchListTile(
+              title: const Text("Приватная комната (пароль)"),
+              value: isPrivate,
+              onChanged: (v) => setState(() => isPrivate = v),
+            ),
+            if (isPrivate)
+              TextField(
+                controller: passCtrl,
+                decoration: const InputDecoration(labelText: "Пароль"),
+                obscureText: true,
+              ),
+            const SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: creating ? null : _createRoom,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF6C29FF),
+              ),
+              child: creating
+                  ? const Text("Создаём...")
+                  : const Text("Создать"),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// ---------------- RoomHostPage ----------------
+class RoomHostPage extends StatefulWidget {
+  final WebSocketService channelService;
+  final String username;
+  final String roomId;
+  final Map<String, dynamic> roomMeta;
+  const RoomHostPage({
+    super.key,
+    required this.channelService,
+    required this.username,
+    required this.roomId,
+    required this.roomMeta,
+  });
+
+  @override
+  State<RoomHostPage> createState() => _RoomHostPageState();
+}
+
+class _RoomHostPageState extends State<RoomHostPage> {
+  late final YoutubePlayerController yt;
+  final TextEditingController msgCtrl = TextEditingController();
+  final List<Map<String, String>> messages = [];
+  VoiceChatManager? voice;
+  bool micEnabled = true;
+  bool videoLoaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final initialVideo = widget.roomMeta['videoId'] as String?;
+    yt = YoutubePlayerController(
+      initialVideoId: initialVideo?.isNotEmpty == true ? initialVideo! : "",
+      flags: const YoutubePlayerFlags(autoPlay: false),
+    );
+    if (initialVideo != null && initialVideo.isNotEmpty) videoLoaded = true;
+
+    // listen to broadcast stream
+    widget.channelService.stream.listen((d) {
+      final t = d['type'];
+      if (t == 'message') {
+        setState(
+          () => messages.insert(0, {
+            "user": d['username'] ?? '',
+            "text": d['text'] ?? '',
+          }),
+        );
+      } else if (t == 'video_control' && d['videoId'] != null) {
+        final id = d['videoId'].toString();
+        if (id.isNotEmpty) {
+          yt.load(id);
+          setState(() => videoLoaded = true);
+        }
+      } else if (t == 'signal') {
+        voice?.handleSignal(d);
+      }
+    });
+
+    // send enter_room (server validates password earlier)
+    widget.channelService.send({
+      "type": "enter_room",
+      "roomId": widget.roomId,
+      "username": widget.username,
+    });
+
+    voice = VoiceChatManager(
+      username: widget.username,
+      roomId: widget.roomId,
+      channelService: widget.channelService,
+    );
+    voice!.init();
+  }
+
+  void sendMessage() {
+    final text = msgCtrl.text.trim();
+    if (text.isEmpty) return;
+    widget.channelService.send({
+      "type": "message",
+      "username": widget.username,
+      "text": text,
+      "roomId": widget.roomId,
+    });
+    setState(() {
+      messages.insert(0, {"user": widget.username, "text": text});
+      msgCtrl.clear();
+    });
+  }
+
+  void loadVideoFromUrl(String url) {
+    final id = YoutubePlayer.convertUrlToId(url);
+    if (id == null) return;
+    widget.channelService.send({
+      "type": "video_control",
+      "action": "load",
+      "videoId": id,
+      "roomId": widget.roomId,
+    });
+    yt.load(id);
+    setState(() => videoLoaded = true);
+  }
+
+  @override
+  void dispose() {
+    try {
+      yt.dispose();
+    } catch (_) {}
+    try {
+      voice?.dispose();
+    } catch (_) {}
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.roomMeta['name'] ?? widget.roomId),
+        centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.exit_to_app),
+            onPressed: () => Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(builder: (_) => const MainNavigation()),
+            ),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 300),
+            child: videoLoaded
+                ? YoutubePlayer(controller: yt, key: const ValueKey("player"))
+                : Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            decoration: const InputDecoration(
+                              hintText: "Вставьте ссылку на YouTube",
+                            ),
+                            onSubmitted: (v) => loadVideoFromUrl(v),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.check),
+                          onPressed: () {},
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: ListView.builder(
+              reverse: true,
+              itemCount: messages.length,
+              itemBuilder: (_, i) {
+                final m = messages[i];
+                return ListTile(
+                  leading: CircleAvatar(
+                    backgroundColor: const Color(0xFF6C29FF),
+                    child: Text((m['user'] ?? '?').substring(0, 1)),
+                  ),
+                  title: Text(m['user'] ?? ''),
+                  subtitle: Text(m['text'] ?? ''),
+                );
+              },
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: msgCtrl,
+                    decoration: const InputDecoration(hintText: "Сообщение..."),
+                    onSubmitted: (_) => sendMessage(),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.send),
+                  onPressed: sendMessage,
+                ),
+                IconButton(
+                  icon: Icon(micEnabled ? Icons.mic : Icons.mic_off),
+                  onPressed: () {
+                    micEnabled = !micEnabled;
+                    final s = voice?.localStream;
+                    if (s != null)
+                      for (var t in s.getAudioTracks()) t.enabled = micEnabled;
+                    setState(() {});
+                  },
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// ---------------- ProfilePage ----------------
+class ProfilePage extends StatelessWidget {
+  final String username;
+  const ProfilePage({super.key, required this.username});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Text("Профиль: $username", style: const TextStyle(fontSize: 18)),
+    );
+  }
+}
+
+/// ---------------- VoiceChatManager ----------------
+/// Uses WebSocketService to send/receive signals. channelService.stream is broadcast.
+class VoiceChatManager {
+  final String username;
+  final String roomId;
+  final WebSocketService channelService;
+
+  MediaStream? localStream;
+  final Map<String, RTCPeerConnection> pcs = {};
+
+  VoiceChatManager({
+    required this.username,
+    required this.roomId,
+    required this.channelService,
+  });
+
+  Future<void> init() async {
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        "audio": true,
+        "video": false,
+      });
+    } catch (e) {
+      // ignore
+    }
+    // notify server join (server logic expects enter_room; this helps signalling)
+    channelService.send({
+      "type": "join",
+      "username": username,
+      "roomId": roomId,
+    });
+  }
+
+  Future<void> handleSignal(dynamic msg) async {
+    final from = msg['from'];
+    final data = msg['data'];
+    if (from == null || data == null) return;
+
+    if (data['peers'] != null) {
+      for (var id in data['peers']) if (id != username) _call(id);
+    }
+
+    if (data['type'] == 'offer' || data['type'] == 'answer') {
+      final pc = await _pc(from);
+      await pc.setRemoteDescription(
+        RTCSessionDescription(data['sdp'], data['type']),
+      );
+      if (data['type'] == 'offer') {
+        final ans = await pc.createAnswer();
+        await pc.setLocalDescription(ans);
+        _send(from, {'sdp': ans.sdp, 'type': ans.type});
+      }
+    }
+
+    if (data['candidate'] != null) {
+      final pc = await _pc(from);
+      await pc.addCandidate(
+        RTCIceCandidate(
+          data['candidate']['candidate'],
+          data['candidate']['sdpMid'],
+          data['candidate']['sdpMLineIndex'],
+        ),
+      );
+    }
+  }
+
+  Future<RTCPeerConnection> _pc(String id) async {
+    if (pcs.containsKey(id)) return pcs[id]!;
+    final pc = await createPeerConnection({
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'},
+      ],
+    }, {});
+    if (localStream != null) {
+      for (var t in localStream!.getAudioTracks())
+        await pc.addTrack(t, localStream!);
+    }
+    pc.onIceCandidate = (c) {
+      if (c != null)
+        _send(id, {
+          'candidate': {
+            'candidate': c.candidate,
+            'sdpMid': c.sdpMid,
+            'sdpMLineIndex': c.sdpMLineIndex,
+          },
+        });
+    };
+    pcs[id] = pc;
+    return pc;
+  }
+
+  Future<void> _call(String id) async {
+    final pc = await _pc(id);
+    final offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    _send(id, {'sdp': offer.sdp, 'type': offer.type});
+  }
+
+  void _send(String target, dynamic data) {
+    channelService.send({
+      'type': 'signal',
+      'from': username,
+      'target': target,
+      'roomId': roomId,
+      'data': data,
+    });
+  }
+
+  void dispose() {
+    try {
+      localStream?.dispose();
+    } catch (_) {}
+    for (var pc in pcs.values)
+      try {
+        pc.close();
+      } catch (_) {}
+    pcs.clear();
+  }
+}
