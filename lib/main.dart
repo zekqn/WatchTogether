@@ -64,7 +64,7 @@ class _MainNavigationState extends State<MainNavigation> {
   @override
   Widget build(BuildContext context) {
     final pages = [
-      HomePage(username: username),
+      HomePage(initialNickname: username),
       RoomsPage(username: username),
       CreateRoomPage(username: username),
       ProfilePage(
